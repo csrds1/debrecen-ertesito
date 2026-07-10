@@ -29,9 +29,29 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
-    "Accept-Language": "hu-HU,hu;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
-TIMEOUT = 20
+TIMEOUT = 25
+
+# Egy közös session-t használunk minden lekéréshez, hogy az esetleges
+# session-cookie-k (amiket az oldal az első látogatáskor beállít) a
+# következő kéréseknél is megmaradjanak - így jobban hasonlít egy valódi
+# böngésző viselkedésére, mint ha minden kérés "előzmény nélküli" lenne.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+_WARMED_UP_DOMAINS: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Figyelt oldalak konfigurációja.
@@ -102,14 +122,46 @@ def save_state(state: dict) -> None:
     )
 
 
-def fetch(url: str) -> str | None:
+def _domain_root(url: str) -> str:
+    match = re.match(r"(https?://[^/]+)", url)
+    return match.group(1) if match else url
+
+
+def _warm_up(url: str) -> None:
+    """Meglátogatja az oldal főoldalát, hogy a session felvegye a
+    szokásos session-cookie-kat, mielőtt a tényleges keresési oldalra
+    mennénk - néhány oldal ez alapján dönti el, hogy botról van-e szó."""
+    root = _domain_root(url)
+    if root in _WARMED_UP_DOMAINS:
+        return
+    _WARMED_UP_DOMAINS.add(root)
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as exc:
-        print(f"  [HIBA] Nem sikerült letölteni: {url} ({exc})", file=sys.stderr)
-        return None
+        SESSION.get(root, timeout=TIMEOUT)
+        time.sleep(1.5)
+    except requests.RequestException:
+        pass  # ha a bemelegítés nem sikerül, próbáljuk meg a tényleges kérést azért
+
+
+def fetch(url: str) -> str | None:
+    _warm_up(url)
+
+    headers = dict(HEADERS)
+    headers["Referer"] = _domain_root(url) + "/"
+
+    for attempt in range(2):
+        try:
+            resp = SESSION.get(url, headers=headers, timeout=TIMEOUT)
+            if resp.status_code == 403 and attempt == 0:
+                # egy második próbálkozás előtt várjunk egy kicsit,
+                # hátha csak átmeneti/sebesség-korlátozásról van szó
+                time.sleep(4)
+                continue
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as exc:
+            print(f"  [HIBA] Nem sikerült letölteni: {url} ({exc})", file=sys.stderr)
+            return None
+    return None
 
 
 def extract_listings(html: str, site: dict) -> list[dict]:
